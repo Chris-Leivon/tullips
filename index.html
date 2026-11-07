@@ -1,0 +1,1096 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tulip Bloom Live</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0a0d; overflow: hidden;
+               font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #stage { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+           height: min(100vh, 177.7778vw); height: min(100dvh, 177.7778vw);   /* dvh = ignores mobile browser bars */
+           aspect-ratio: 9 / 16; background: #120f14;
+           --sw: min(56.25vh, 100vw); /* stage width; script keeps it exact. Everything in the screens scales from it */ }
+  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud { pointer-events: none; }
+
+  /* ---- welcome screen (fades out when the button is pressed) ---- */
+  #intro { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center;
+           padding: calc(var(--sw) * .08); box-sizing: border-box; text-align: center;
+           background: rgba(11, 10, 13, .66); -webkit-backdrop-filter: blur(5px); backdrop-filter: blur(5px);
+           opacity: 1; transition: opacity 1s ease; }
+  #intro.leaving { opacity: 0; pointer-events: none; }
+  #intro.gone { display: none; }
+  #intro-inner { display: flex; flex-direction: column; align-items: center; gap: calc(var(--sw) * .09); max-width: 100%; }
+  #hello { margin: 0; font: 400 calc(var(--sw) * .058)/1.5 "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+           letter-spacing: .14em; color: rgb(235, 225, 215); }
+  #hello .w { display: inline-block; white-space: nowrap; }
+  #hello .c { opacity: 0; animation: letterIn .55s ease forwards; }
+  @keyframes letterIn { to { opacity: 1; } }
+  #go { appearance: none; cursor: pointer; border-radius: 999px;
+        font: 400 max(14px, calc(var(--sw) * .036))/1 "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+        padding: .85em 2.3em; touch-action: manipulation; -webkit-tap-highlight-color: transparent; letter-spacing: .08em;
+        color: rgb(240, 195, 165); background: rgba(240, 195, 165, .08);
+        border: 1px solid rgba(240, 195, 165, .7);
+        opacity: 0; animation: letterIn .8s ease forwards; transition: background .2s, color .2s, transform .2s; }
+  @media (hover: hover) { #go:hover { background: rgb(240, 195, 165); color: #1a1218; transform: translateY(-1px); } }
+  #go:active { background: rgb(240, 195, 165); color: #1a1218; }
+  #go:focus-visible { outline: 2px solid #f0c3a5; outline-offset: 4px; }
+  #go:disabled { cursor: default; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center;
+         color: #eadfd7; background: #0b0a0d; font-size: 15px; line-height: 1.5; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <canvas id="hud"></canvas>
+  <div id="intro">
+    <div id="intro-inner">
+      <h1 id="hello" aria-label="HELLO AWE, HEARD YOU LIKE TULIPS"></h1>
+      <button id="go" type="button">click me please</button>
+    </div>
+  </div>
+</div>
+<div id="err"></div>
+
+<script>
+(() => {
+'use strict';
+
+const DURATION = 13.0, REF_W = 1080, REF_H = 1920, HOLD = 2.0;
+
+function showError(msg) {
+  const e = document.getElementById('err');
+  e.style.display = 'grid'; e.textContent = msg;
+}
+window.addEventListener('error', ev => showError('Error: ' + ev.message));
+
+// ============================================================================
+// MATH UTILITIES
+// ============================================================================
+const PI = Math.PI;
+const clamp01 = x => x < 0 ? 0 : (x > 1 ? 1 : x);
+function smoothstep(e0, e1, x) { const t = clamp01((x - e0) / Math.max(1e-8, e1 - e0)); return t * t * (3 - 2 * t); }
+function smootherstep(e0, e1, x) { const t = clamp01((x - e0) / Math.max(1e-8, e1 - e0)); return t * t * t * (t * (t * 6 - 15) + 10); }
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const vlen = a => Math.hypot(a[0], a[1], a[2]);
+const vnorm = a => { const l = Math.max(1e-8, vlen(a)); return [a[0]/l, a[1]/l, a[2]/l]; };
+const vadd = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const vsub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const vmul = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+
+// row-major 3x3
+function rotX(a) { const c = Math.cos(a), s = Math.sin(a); return [1,0,0, 0,c,-s, 0,s,c]; }
+function rotY(a) { const c = Math.cos(a), s = Math.sin(a); return [c,0,s, 0,1,0, -s,0,c]; }
+function mul3(A, B) {
+  const R = new Array(9);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    R[i*3+j] = A[i*3]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+  return R;
+}
+const transpose3 = M => [M[0],M[3],M[6], M[1],M[4],M[7], M[2],M[5],M[8]];
+
+// Seeded PRNG (mulberry32) — stands in for numpy RandomState
+function makeRng(seed) {
+  let a = seed >>> 0;
+  const next = () => { a = (a + 0x6D2B79F5) >>> 0; let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  return { uniform: (lo = 0, hi = 1) => lo + (hi - lo) * next() };
+}
+
+function buildBasisFromDir(direction) {
+  let up = [0, 1, 0];
+  const y = vnorm(direction);
+  if (Math.abs(dot(y, up)) > 0.95) up = [0, 0, 1];
+  const x = vnorm(cross(up, y));
+  const z = vnorm(cross(x, y));
+  return { X: x, Y: y, Z: z };
+}
+const applyBasis = (B, p) => [
+  B.X[0]*p[0] + B.Y[0]*p[1] + B.Z[0]*p[2],
+  B.X[1]*p[0] + B.Y[1]*p[1] + B.Z[1]*p[2],
+  B.X[2]*p[0] + B.Y[2]*p[1] + B.Z[2]*p[2]];
+
+function evalBezier(p0, p1, p2, p3, u) {
+  const om = 1 - u;
+  const pos = [0,0,0], tan = [0,0,0];
+  for (let k = 0; k < 3; k++) {
+    pos[k] = om*om*om*p0[k] + 3*om*om*u*p1[k] + 3*om*u*u*p2[k] + u*u*u*p3[k];
+    tan[k] = 3*om*om*(p1[k]-p0[k]) + 6*om*u*(p2[k]-p1[k]) + 3*u*u*(p3[k]-p2[k]);
+  }
+  return [pos, tan];
+}
+
+function bishopFrame(T) {
+  const n = T.length, N1 = new Array(n), N2 = new Array(n);
+  const t0 = T[0];
+  let ref = [0, 0, 1];
+  if (Math.abs(dot(t0, ref)) > 0.9) ref = [1, 0, 0];
+  let n1 = vnorm(cross(t0, ref));
+  let n2 = cross(t0, n1);
+  N1[0] = n1; N2[0] = n2;
+  for (let i = 1; i < n; i++) {
+    const ti = T[i];
+    let pr = vsub(n1, vmul(ti, dot(n1, ti)));
+    let l = vlen(pr);
+    if (l < 1e-6) { pr = cross(ti, n2); l = vlen(pr); }
+    n1 = vmul(pr, 1 / Math.max(1e-8, l));
+    n2 = cross(ti, n1);
+    N1[i] = n1; N2[i] = n2;
+  }
+  return [N1, N2];
+}
+
+// ============================================================================
+// ELEMENT (parametric surface) — mesh + normals + colours + timing
+// ============================================================================
+function computeNormals(P, Nu, Nv, N, wrapV) {
+  N.fill(0);
+  for (let i = 0; i < Nu - 1; i++) {
+    for (let j = 0; j < Nv - 1; j++) {
+      const a = (i*Nv + j)*3, b = ((i+1)*Nv + j)*3, c = ((i+1)*Nv + j + 1)*3, d = (i*Nv + j + 1)*3;
+      const ux = 0.5*((P[b]-P[a]) + (P[c]-P[d])), uy = 0.5*((P[b+1]-P[a+1]) + (P[c+1]-P[d+1])), uz = 0.5*((P[b+2]-P[a+2]) + (P[c+2]-P[d+2]));
+      const vx = 0.5*((P[d]-P[a]) + (P[c]-P[b])), vy = 0.5*((P[d+1]-P[a+1]) + (P[c+1]-P[b+1])), vz = 0.5*((P[d+2]-P[a+2]) + (P[c+2]-P[b+2]));
+      let nx = vy*uz - vz*uy, ny = vz*ux - vx*uz, nz = vx*uy - vy*ux;
+      const l = Math.hypot(nx, ny, nz);
+      if (l < 1e-12) continue;
+      nx /= l; ny /= l; nz /= l;
+      N[a] += nx; N[a+1] += ny; N[a+2] += nz;
+      N[b] += nx; N[b+1] += ny; N[b+2] += nz;
+      N[c] += nx; N[c+1] += ny; N[c+2] += nz;
+      N[d] += nx; N[d+1] += ny; N[d+2] += nz;
+    }
+  }
+  if (wrapV) {
+    for (let i = 0; i < Nu; i++) {
+      const a = (i*Nv)*3, b = (i*Nv + Nv - 1)*3;
+      for (let k = 0; k < 3; k++) { const s = N[a+k] + N[b+k]; N[a+k] = s; N[b+k] = s; }
+    }
+  }
+  for (let k = 0; k < N.length; k += 3) {
+    const l = Math.max(1e-8, Math.hypot(N[k], N[k+1], N[k+2]));
+    N[k] /= l; N[k+1] /= l; N[k+2] /= l;
+  }
+}
+
+function makeElement(kind, P, C, Nu, Nv, o) {
+  const el = Object.assign({
+    kind, Nu, Nv, pos: P, col: C,
+    sss: 0.35, spec: 0.25, shin: 18, wireColor: [1, 1, 1], strideU: 4, strideV: 3,
+    isPetal: false, Pclosed: null, papillae: null, wrapV: false,
+  }, o);
+  const nv = Nu * Nv;
+  el.uv = new Float32Array(nv * 2);
+  for (let i = 0; i < Nu; i++) for (let j = 0; j < Nv; j++) {
+    const k = (i*Nv + j)*2;
+    el.uv[k] = i / (Nu - 1);
+    el.uv[k+1] = Math.abs(-1 + 2*j/(Nv - 1));
+  }
+  el.qEff = new Float32Array((Nu-1)*(Nv-1));   // same blend as the Python per-quad eff_u
+  for (let i = 0; i < Nu-1; i++) for (let j = 0; j < Nv-1; j++) {
+    const uq = ((i + 0.5) / (Nu - 1));
+    const v0 = Math.abs(-1 + 2*j/(Nv-1)), v1 = Math.abs(-1 + 2*(j+1)/(Nv-1));
+    el.qEff[i*(Nv-1) + j] = 0.85*uq + 0.15*0.5*(v0 + v1);
+  }
+  el.nrm = new Float32Array(nv * 3);
+  computeNormals(el.pos, Nu, Nv, el.nrm, el.wrapV);
+
+  const tri = [];
+  for (let i = 0; i < Nu-1; i++) for (let j = 0; j < Nv-1; j++) {
+    const a = i*Nv + j, b = (i+1)*Nv + j, c = (i+1)*Nv + j + 1, d = i*Nv + j + 1;
+    tri.push(a, b, c, a, c, d);
+  }
+  el.triIdx = new Uint16Array(tri);
+
+  const vIdx = [];
+  for (let j = 0; j < Nv; j += el.strideV) vIdx.push(j);
+  if (vIdx[vIdx.length-1] !== Nv - 1) vIdx.push(Nv - 1);
+  el.vIdx = vIdx;
+  const ln = [];
+  for (const j of vIdx) for (let i = 0; i < Nu-1; i++) ln.push(i*Nv + j, (i+1)*Nv + j);
+  for (let i = 0; i < Nu; i += el.strideU) for (let j = 0; j < Nv-1; j++) ln.push(i*Nv + j, i*Nv + j + 1);
+  el.lineIdx = new Uint16Array(ln);
+  el.lastB = -1;
+  return el;
+}
+
+// ============================================================================
+// GEOMETRY GENERATORS (ported 1:1 from the Python)
+// ============================================================================
+function genStemTube(p0, p1, p2, p3, rBase, rTip, Nu, Nv, colBase, colTip, wt0, wt1, st0, st1) {
+  const pos = [], T = [];
+  for (let i = 0; i < Nu; i++) {
+    const [p, t] = evalBezier(p0, p1, p2, p3, i/(Nu-1));
+    pos.push(p); T.push(vnorm(t));
+  }
+  const [N1, N2] = bishopFrame(T);
+  const P = new Float32Array(Nu*Nv*3), C = new Float32Array(Nu*Nv*3);
+  for (let i = 0; i < Nu; i++) {
+    const u = i/(Nu-1);
+    let r = rBase*(1-u) + rTip*u;
+    if (u > 0.90) r *= 1 + 0.25*smoothstep(0.90, 1.0, u);
+    for (let j = 0; j < Nv; j++) {
+      const th = (-1 + 2*j/(Nv-1) + 1) * PI;
+      const rad = r * (1 + 0.025*Math.cos(6*th));
+      const co = Math.cos(th), si = Math.sin(th), k = (i*Nv + j)*3;
+      for (let a = 0; a < 3; a++) {
+        P[k+a] = pos[i][a] + rad*(co*N1[i][a] + si*N2[i][a]);
+        C[k+a] = ((1-u)*colBase[a] + u*colTip[a]) * (0.95 + 0.05*Math.cos(6*th));
+      }
+    }
+  }
+  const el = makeElement('stem', P, C, Nu, Nv, {
+    wire_t0: wt0, wire_t1: wt1, surf_t0: st0, surf_t1: st1,
+    sss: 0.22, spec: 0.25, shin: 18, wireColor: [0.38, 0.88, 0.50], strideU: 6, strideV: 4, wrapV: true });
+  return [el, pos, T];
+}
+
+function genTulipLeaf(origin, azimuth, length, width, archDrop, twist, wt0, wt1, st0, st1) {
+  const Nu = 40, Nv = 17;
+  const P = new Float32Array(Nu*Nv*3), C = new Float32Array(Nu*Nv*3);
+  const cD = [0.09, 0.25, 0.20], cM = [0.22, 0.46, 0.34], cV = [0.46, 0.66, 0.54], cT = [0.30, 0.52, 0.40], cG = [0.55, 0.72, 0.66];
+  const ca = Math.cos(azimuth), sa = Math.sin(azimuth);
+  for (let i = 0; i < Nu; i++) {
+    const U = i/(Nu-1);
+    const wProf = width*Math.pow(Math.max(0, Math.sin(PI*Math.pow(U, 0.55))), 0.85)*(1 - 0.25*U) + 0.35*width*Math.pow(1-U, 5);
+    const reach = length*(0.62*U + 0.10*Math.sin(0.5*PI*U));
+    const elev = length*(0.60*U - archDrop*Math.pow(U, 1.8));
+    const tw = twist*Math.pow(U, 1.3);
+    for (let j = 0; j < Nv; j++) {
+      const V = -1 + 2*j/(Nv-1);
+      const fold = 0.09*width*Math.pow(Math.abs(V), 1.2)*(1 - 0.4*U);
+      const wave = 0.04*width*V*V*Math.sin(14*U + 1.3*V)*smoothstep(0.1, 0.5, U);
+      const f = fold + wave;
+      const xl = wProf*V*Math.cos(tw) - f*Math.sin(tw);
+      const zl = elev + wProf*V*Math.sin(tw) + f*Math.cos(tw);
+      const yl = reach;
+      const k = (i*Nv + j)*3;
+      P[k]   = origin[0] + ca*xl + sa*yl;
+      P[k+1] = origin[1] + zl;
+      P[k+2] = origin[2] - sa*xl + ca*yl;
+      const mid = Math.exp(-Math.pow(V/0.08, 2));
+      const edge = Math.pow(Math.abs(V), 1.4);
+      for (let a = 0; a < 3; a++) {
+        let c = (1-edge)*cM[a] + edge*cD[a];
+        c = c*(1 - 0.30*U*U) + cT[a]*(0.30*U*U);
+        c = c*(1 - 0.50*mid) + cV[a]*(0.50*mid);
+        C[k+a] = c*0.82 + cG[a]*0.18;     // waxy glaucous bloom
+      }
+    }
+  }
+  return makeElement('leaf', P, C, Nu, Nv, {
+    wire_t0: wt0, wire_t1: wt1, surf_t0: st0, surf_t1: st1,
+    sss: 0.26, spec: 0.40, shin: 30, wireColor: [0.50, 0.92, 0.70], strideU: 7, strideV: 4 });
+}
+
+function genTulipTepal(center, B, az, isInner, scale, open, wt0, wt1, st0, st1) {
+  const Nu = 72, Nv = 33;
+  const L = (isInner ? 1.00 : 1.06)*scale;
+  const alphaMax = isInner ? 1.02 : 1.10;       // half the angular span of one tepal around the cup axis
+  const spiral = isInner ? 0.015 : 0.018;       // one edge sits over its neighbour (avoids z-fighting)
+  const baseF = isInner ? 0.90 : 1.00;          // inner whorl sits just inside the outer one
+
+  function build(o) {
+    const rr = new Float32Array(Nu), yy = new Float32Array(Nu);
+    const ang = u => 0.60*(1 - smoothstep(0, 0.30, u))
+      + (0.22 + 0.20*o)*smoothstep(0, 0.35, u)*(1 - smoothstep(0.35, 0.75, u))
+      + (-0.70 + 1.45*o)*smoothstep(0.45, 1.0, u);
+    const ds = L/(Nu-1);
+    rr[0] = 0.05*scale; yy[0] = 0;
+    for (let i = 1; i < Nu; i++) {
+      const a = 0.5*(ang((i-1)/(Nu-1)) + ang(i/(Nu-1)));
+      rr[i] = rr[i-1] + ds*Math.sin(a);
+      yy[i] = yy[i-1] + ds*Math.cos(a);
+    }
+    const out = new Float32Array(Nu*Nv*3);
+    for (let i = 0; i < Nu; i++) {
+      const U = i/(Nu-1);
+      const env = U < 0.45 ? 1 : Math.pow(Math.max(0, 1 - Math.pow((U - 0.45)/0.55, isInner ? 2.0 : 2.4)), 0.55);
+      const alpha = alphaMax*env;
+      const curl = isInner ? 0 : 0.05*scale*o*smoothstep(0.5, 1.0, U);
+      for (let j = 0; j < Nv; j++) {
+        const V = -1 + 2*j/(Nv-1);
+        const f = baseF + 0.07*(1 - V*V) + spiral*V;
+        const rad = Math.max(0.004*scale, rr[i]*f + curl*V*V);
+        const th = az + alpha*V;
+        const w = applyBasis(B, [rad*Math.sin(th), yy[i], rad*Math.cos(th)]);
+        const k = (i*Nv + j)*3;
+        out[k] = center[0] + w[0]; out[k+1] = center[1] + w[1]; out[k+2] = center[2] + w[2];
+      }
+    }
+    return out;
+  }
+  const P = build(open), Pc = build(0.0);
+
+  const cR = [0.80, 0.03, 0.06], cBr = [0.96, 0.14, 0.10], cDp = [0.36, 0.01, 0.04], cE = [0.98, 0.30, 0.14], cK = [0.08, 0.01, 0.04];
+  const C = new Float32Array(Nu*Nv*3);
+  for (let i = 0; i < Nu; i++) {
+    const U = i/(Nu-1);
+    const toRed = smoothstep(0.0, 0.35, U);
+    const bright = 0.55*smoothstep(0.3, 0.9, U);
+    const edgeU = smoothstep(0.2, 0.8, U);
+    const veinU = smoothstep(0.1, 0.9, U);
+    for (let j = 0; j < Nv; j++) {
+      const V = -1 + 2*j/(Nv-1), aV = Math.abs(V);
+      const k = (i*Nv + j)*3;
+      const bl = bright*(1 - V*V);
+      const ed = 0.35*smoothstep(0.55, 1.0, aV)*edgeU;
+      const rib = 0.5 + 0.5*Math.cos(V*16*PI);
+      const midr = 0.05*Math.exp(-Math.pow(V/0.05, 2))*veinU;
+      const blotch = (1 - smoothstep(0.05, 0.20, U))*Math.exp(-Math.pow(V/0.6, 2));
+      for (let a = 0; a < 3; a++) {
+        let c = cDp[a]*(1 - toRed) + cR[a]*toRed;
+        c = c*(1 - bl) + cBr[a]*bl;
+        c = c*(1 - ed) + cE[a]*ed;
+        c *= 1 - 0.07*(1 - rib)*veinU;
+        c += midr;
+        c = c*(1 - 0.85*blotch) + cK[a]*(0.85*blotch);
+        C[k+a] = c;
+      }
+    }
+  }
+
+  const el = makeElement('petal', P, C, Nu, Nv, {
+    wire_t0: wt0, wire_t1: wt1, surf_t0: st0, surf_t1: st1,
+    sss: 0.40, spec: 0.55, shin: 45, wireColor: [1.0, 0.55, 0.50], strideU: 8, strideV: 4,
+    isPetal: true, Pclosed: Pc });
+  el.Pfull = Float32Array.from(P);
+  return el;
+}
+
+function genTulipStamens(center, B, scale, wt0, wt1, st0, st1) {
+  const els = [];
+  const toWorld = p => { const w = applyBasis(B, p); return [center[0]+w[0], center[1]+w[1], center[2]+w[2]]; };
+
+  // stout pistil: ridged ovary + three-lobed stigma
+  {
+    const Nu = 30, Nv = 13;
+    const p0 = [0, 0, 0], p1 = vmul([0.008, 0.20, 0.006], scale), p2 = vmul([0.010, 0.40, 0.010], scale), p3 = vmul([0.006, 0.60, 0.012], scale);
+    const pos = [], T = [];
+    for (let i = 0; i < Nu; i++) { const [p, t] = evalBezier(p0, p1, p2, p3, i/(Nu-1)); pos.push(p); T.push(vnorm(t)); }
+    const [N1, N2] = bishopFrame(T);
+    const P = new Float32Array(Nu*Nv*3), C = new Float32Array(Nu*Nv*3);
+    const cG = [0.60, 0.72, 0.28], cS = [0.95, 0.88, 0.50];
+    for (let i = 0; i < Nu; i++) {
+      const u = i/(Nu-1);
+      const tipClose = u > 0.92 ? Math.pow(Math.max(1e-12, Math.sin(PI*u)), 0.22) : 1.0;
+      const base = scale*(0.030 + 0.028*Math.exp(-Math.pow((u - 0.22)/0.20, 2)));
+      const mix = smoothstep(0.78, 0.88, u);
+      for (let j = 0; j < Nv; j++) {
+        const th = (-1 + 2*j/(Nv-1) + 1)*PI;
+        let r = base*(1 + 0.10*Math.cos(3*th));
+        if (u > 0.80) {
+          const sw = Math.sin(PI*(u - 0.80)/0.20);
+          r = (base*0.7 + scale*0.055*sw*(1 + 0.5*Math.cos(3*th)))*tipClose;
+        }
+        const co = Math.cos(th), si = Math.sin(th), k = (i*Nv + j)*3;
+        const w = toWorld([0,1,2].map(a => pos[i][a] + r*(co*N1[i][a] + si*N2[i][a])));
+        P[k] = w[0]; P[k+1] = w[1]; P[k+2] = w[2];
+        for (let a = 0; a < 3; a++) C[k+a] = (1-mix)*cG[a] + mix*cS[a];
+      }
+    }
+    els.push(makeElement('pistil', P, C, Nu, Nv, {
+      wire_t0: wt0, wire_t1: wt1, surf_t0: st0, surf_t1: st1,
+      sss: 0.30, spec: 0.35, shin: 28, wireColor: [0.80, 0.95, 0.50], strideU: 6, strideV: 4, wrapV: true }));
+  }
+
+  for (let k = 0; k < 6; k++) {
+    const az = k*(PI/3) + 0.30, ca = Math.cos(az), sa = Math.sin(az);
+    const hT = (0.52 + 0.04*(k % 2))*scale, rT = (0.12 + 0.015*(k % 3))*scale;
+    const fp0 = [0.028*scale*ca, 0.02*scale, 0.028*scale*sa];
+    const fp3 = [rT*ca, hT, rT*sa];
+    const bow = [0.02*scale*ca, 0, 0.02*scale*sa];
+    const fp1 = [0,1,2].map(a => fp0[a] + (fp3[a] - fp0[a])*0.33);
+    const fp2 = [0,1,2].map(a => fp0[a] + (fp3[a] - fp0[a])*0.66 + bow[a]);
+
+    const Nu = 18, Nv = 8;
+    const fpos = [], Tf = [];
+    for (let i = 0; i < Nu; i++) { const [p, t] = evalBezier(fp0, fp1, fp2, fp3, i/(Nu-1)); fpos.push(p); Tf.push(vnorm(t)); }
+    const [N1, N2] = bishopFrame(Tf);
+    const P = new Float32Array(Nu*Nv*3), C = new Float32Array(Nu*Nv*3);
+    const cB = [0.82, 0.80, 0.45], cTp = [0.92, 0.90, 0.62];
+    for (let i = 0; i < Nu; i++) {
+      const u = i/(Nu-1), rf = scale*0.011*(1 - 0.35*u);
+      for (let j = 0; j < Nv; j++) {
+        const th = (-1 + 2*j/(Nv-1) + 1)*PI, co = Math.cos(th), si = Math.sin(th), kk = (i*Nv + j)*3;
+        const w = toWorld([0,1,2].map(a => fpos[i][a] + rf*(co*N1[i][a] + si*N2[i][a])));
+        P[kk] = w[0]; P[kk+1] = w[1]; P[kk+2] = w[2];
+        for (let a = 0; a < 3; a++) C[kk+a] = (1-u)*cB[a] + u*cTp[a];
+      }
+    }
+    const sd = 0.06*k;
+    els.push(makeElement('filament', P, C, Nu, Nv, {
+      wire_t0: wt0 + sd, wire_t1: wt1 + sd*0.5, surf_t0: st0 + sd, surf_t1: st1 + sd*0.5,
+      sss: 0.30, spec: 0.25, shin: 20, wireColor: [0.95, 0.90, 0.65], strideU: 5, strideV: 3, wrapV: true }));
+
+    // erect, dark anther dusted with pollen
+    const Na = 14, Nva = 10, antherLen = 0.17*scale;
+    const aAxis = vnorm(vsub(fp3, fp2));
+    const an1 = vnorm(cross(aAxis, [ca, 0, sa])), an2 = vnorm(cross(aAxis, an1));
+    const Pa = new Float32Array(Na*Nva*3), Ca = new Float32Array(Na*Nva*3);
+    const c1 = [0.10, 0.04, 0.14], c2 = [0.50, 0.42, 0.12];
+    for (let i = 0; i < Na; i++) {
+      const ua = i/(Na-1), sAlong = (ua - 0.5)*antherLen + 0.45*antherLen;
+      const env = Math.pow(Math.max(0, Math.sin(PI*ua)), 0.60);
+      for (let j = 0; j < Nva; j++) {
+        const th = (-1 + 2*j/(Nva-1) + 1)*PI, co = Math.cos(th), si = Math.sin(th);
+        const ra = 0.026*scale*env*(1 + 0.30*Math.cos(2*th));
+        const w = toWorld([0,1,2].map(a => fp3[a] + sAlong*aAxis[a] + ra*(co*an1[a] + si*an2[a])));
+        const kk = (i*Nva + j)*3;
+        Pa[kk] = w[0]; Pa[kk+1] = w[1]; Pa[kk+2] = w[2];
+        const grain = 0.5 + 0.5*Math.sin(19*ua + 7*th);
+        for (let a = 0; a < 3; a++) Ca[kk+a] = (1 - 0.30*grain)*c1[a] + 0.30*grain*c2[a];
+      }
+    }
+    els.push(makeElement('anther', Pa, Ca, Na, Nva, {
+      wire_t0: wt0 + 0.25 + sd, wire_t1: wt1 + 0.20 + sd*0.5, surf_t0: st0 + 0.25 + sd, surf_t1: st1 + sd*0.5,
+      sss: 0.20, spec: 0.20, shin: 14, wireColor: [1.0, 0.75, 0.25], strideU: 4, strideV: 3, wrapV: true }));
+  }
+  return els;
+}
+
+// ============================================================================
+// SCENE ASSEMBLY — a bouquet of six red tulips (five in bloom, one still a bud)
+// ============================================================================
+function buildScene() {
+  const els = [];
+  const cBase = [0.15, 0.36, 0.22], cTip = [0.32, 0.58, 0.34];
+
+  const flowers = [
+    { center:[ 0.05, 1.55, 0.05], dir:[ 0.03, 1.0, 0.05], scale:1.00, open:0.62, rot: 0.20, base:[ 0.02, 0.00], w0:2.0, s0:4.2, m0:7.0 },
+    { center:[-0.70, 1.05, 0.15], dir:[-0.45, 1.0, 0.30], scale:0.92, open:0.88, rot: 0.75, base:[-0.08,-0.05], w0:2.3, s0:4.5, m0:7.2 },
+    { center:[ 0.76, 0.80, 0.20], dir:[ 0.50, 1.0, 0.35], scale:0.90, open:0.48, rot:-0.30, base:[ 0.10, 0.03], w0:2.6, s0:4.8, m0:7.4 },
+    { center:[-0.22, 0.30, 0.45], dir:[-0.20, 0.85, 0.75], scale:0.86, open:1.00, rot: 0.50, base:[-0.03, 0.08], w0:2.9, s0:5.1, m0:7.6 },
+    { center:[ 0.45, 0.02, 0.52], dir:[ 0.35, 1.0, 0.60], scale:0.78, open:0.32, rot: 1.10, base:[ 0.06, 0.10], w0:3.2, s0:5.4, m0:7.8 },
+    { center:[-0.95, 1.70,-0.10], dir:[-0.40, 1.0,-0.10], scale:0.70, open:0.10, rot: 0.00, base:[-0.10,-0.08], w0:3.4, s0:5.6, m0:0 },
+  ];
+
+  // stems: one per flower, ending exactly at the cup base and tangent to the flower axis
+  const stemCurves = [];
+  flowers.forEach((f, idx) => {
+    const dN = vnorm(f.dir);
+    const p3 = f.center, p2 = vsub(p3, vmul(dN, 1.0));
+    const p0 = [f.base[0], -2.55, f.base[1]];
+    const p1 = [p0[0] + 0.12*(p2[0] - p0[0]), -1.30, p0[2] + 0.12*(p2[2] - p0[2])];
+    const [el, pos, T] = genStemTube(p0, p1, p2, p3, 0.034, 0.027, 44, 13, cBase, cTip,
+      0.10*idx, 1.4 + 0.10*idx, 0.3 + 0.12*idx, 2.1 + 0.10*idx);
+    els.push(el); stemCurves.push([pos, T]);
+  });
+
+  // [stem, sample, azimuth, length, width, arch, twist, delay]
+  const leaves = [
+    [0, 9,  1.10, 2.20, 0.32, 0.30,  0.25, 0.00], [1, 8, -1.20, 2.30, 0.33, 0.34, -0.25, 0.10],
+    [2,10,  2.40, 2.10, 0.31, 0.28,  0.20, 0.20], [3, 9, -2.30, 2.20, 0.32, 0.32, -0.20, 0.30],
+    [4, 8,  0.35, 1.90, 0.30, 0.36,  0.30, 0.40], [0,14, -0.60, 1.80, 0.28, 0.32, -0.20, 0.50],
+    [1,13,  0.90, 1.85, 0.28, 0.28,  0.20, 0.60], [5,10,  1.90, 1.70, 0.27, 0.28, -0.15, 0.70],
+    [2,15, -1.70, 1.70, 0.26, 0.30,  0.20, 0.80], [3,16,  2.90, 1.50, 0.25, 0.26,  0.20, 0.90],
+  ];
+  for (const [si, ui, az, len, wid, arch, tw, dly] of leaves)
+    els.push(genTulipLeaf(stemCurves[si][0][ui], az, len, wid, arch, tw, 0.75+dly, 2.10+dly, 1.35+dly, 3.15+dly));
+
+  for (const f of flowers) {
+    const B = buildBasisFromDir(f.dir);
+    const w1 = f.w0 + 2.8, s1 = f.s0 + 3.6;
+    for (let k = 0; k < 3; k++) {
+      const dly = 0.12*k;
+      els.push(genTulipTepal(f.center, B, f.rot + k*(2*PI/3), false, f.scale, f.open,
+        f.w0 + dly, w1 + dly, f.s0 + dly, s1 + dly));
+    }
+    for (let k = 0; k < 3; k++) {
+      const dly = 0.18 + 0.12*k;
+      els.push(genTulipTepal(f.center, B, f.rot + (k + 0.5)*(2*PI/3), true, f.scale, f.open,
+        f.w0 + dly, w1 + dly, f.s0 + dly, s1 + dly));
+    }
+    if (f.m0 > 0) els.push(...genTulipStamens(f.center, B, f.scale, f.m0, f.m0 + 1.3, f.m0 + 0.4, f.m0 + 2.4));
+  }
+  return els;
+}
+
+// ============================================================================
+// WEBGL RENDERER
+// ============================================================================
+const stage = document.getElementById('stage');
+const glCanvas = document.getElementById('gl');
+const hudCanvas = document.getElementById('hud');
+const gl = glCanvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'high-performance' });
+if (!gl) { showError('This page needs WebGL2, which your browser or device does not provide.'); return; }
+const hud = hudCanvas.getContext('2d');
+
+const PROJ = `
+uniform mat3 uCam; uniform vec3 uTarget; uniform float uDist;
+vec4 projectPos(vec3 world, float zoff) {
+  vec3 r = uCam * (world - uTarget);
+  float z = max(uDist - r.z, 0.2);
+  float nx = 1660.0 * r.x / (z * 540.0);
+  float ny = -0.06 + 1660.0 * r.y / (z * 960.0);
+  float n = 0.5, f = 14.0, zd = z + zoff;
+  return vec4(nx * z, ny * z, (f + n) / (f - n) * zd - 2.0 * f * n / (f - n), z);
+}`;
+
+const SHADE = `
+vec3 shade(vec3 Nc, vec3 base, float sssS, float specS, float shin) {
+  vec3 Lk = normalize(vec3(-0.42, 0.62, 0.66));
+  vec3 Lf = normalize(vec3(0.65, -0.20, 0.73));
+  vec3 V = vec3(0.0, 0.0, 1.0);
+  vec3 N = Nc.z < 0.0 ? -Nc : Nc;
+  float nk = dot(N, Lk);
+  float dk = clamp((nk + 0.25) / 1.25, 0.0, 1.0);
+  float df = clamp((dot(N, Lf) + 0.40) / 1.40, 0.0, 1.0);
+  float ndv = clamp(N.z, 0.0, 1.0);
+  float fres = pow(1.0 - ndv, 2.2);
+  float back = clamp(-nk * 0.6 + 0.45, 0.0, 1.0);
+  float sss = sssS * (0.55 * fres + 0.45 * back);
+  vec3 H = normalize(Lk + V);
+  float spec = specS * pow(clamp(dot(N, H), 0.0, 1.0), shin);
+  vec3 lit = base * (0.24 + 0.72 * dk * vec3(1.04, 1.01, 0.98) + 0.22 * df * vec3(0.78, 0.86, 0.95))
+           + base * sss * vec3(1.05, 0.82, 0.88)
+           + spec * vec3(1.0, 0.98, 0.95);
+  lit = clamp(lit, 0.0, 1.35);
+  lit = lit / (1.0 + 0.18 * lit) * 1.14;
+  return clamp(lit, 0.0, 1.0);
+}`;
+
+const FS_VERT = `#version 300 es
+out vec2 vUV;
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUV = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const SRC = {
+  bg: [FS_VERT, `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o;
+void main() {
+  float x = vUV.x * 2.0 - 1.0, y = (1.0 - vUV.y) * 2.0 - 1.0;
+  float r2 = pow(x * 0.95, 2.0) + pow((y + 0.08) * 0.75, 2.0);
+  float glow = exp(-1.55 * r2);
+  float up = exp(-2.2 * (pow(x - 0.15, 2.0) + pow(y + 0.32, 2.0)));
+  o = vec4(vec3(16.0 + 26.0*glow + 22.0*up, 12.0 + 22.0*glow + 10.0*up, 14.0 + 24.0*glow + 12.0*up) / 255.0, 1.0);
+}`],
+  surf: [`#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec3 aCol; layout(location=3) in vec2 aUV;
+${PROJ}
+out vec3 vNrm; out vec3 vCol; out vec2 vUV;
+void main() { vNrm = aNrm; vCol = aCol; vUV = aUV; gl_Position = projectPos(aPos, 0.0); }`,
+  `#version 300 es
+precision highp float;
+in vec3 vNrm; in vec3 vCol; in vec2 vUV;
+uniform mat3 uCam; uniform float uSProg, uSss, uSpec, uShin;
+out vec4 o;
+${SHADE}
+void main() {
+  float eff = 0.85 * vUV.x + 0.15 * vUV.y;
+  float lim = uSProg * 1.03;
+  if (eff > lim) discard;
+  vec3 c = shade(uCam * normalize(vNrm), vCol, uSss, uSpec, uShin);
+  if (uSProg < 0.995) {
+    float d = lim - eff;
+    c = clamp(c + 0.55 * exp(-pow(d / 0.055, 2.0)) * vec3(1.0, 0.86, 0.55), 0.0, 1.0);
+  }
+  o = vec4(c, 1.0);
+}`],
+  wire: [`#version 300 es
+layout(location=0) in vec3 aPos; layout(location=3) in vec2 aUV;
+${PROJ}
+out vec2 vUV;
+void main() { vUV = aUV; gl_Position = projectPos(aPos, 0.0); }`,
+  `#version 300 es
+precision highp float; in vec2 vUV; uniform float uWMax; uniform vec3 uColor; out vec4 o;
+void main() { if (vUV.x > uWMax + 1e-4) discard; o = vec4(uColor, 1.0); }`],
+  pap: [`#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in float aR; layout(location=2) in vec3 aCore; layout(location=3) in vec3 aRim;
+${PROJ}
+uniform float uScale;
+out float vR; out vec3 vCore; out vec3 vRim; out float vSize;
+void main() {
+  vR = aR; vCore = aCore; vRim = aRim;
+  vSize = max(3.0, 2.0 * (aR + 2.0) * uScale);
+  gl_PointSize = vSize;
+  gl_Position = projectPos(aPos, -0.04);
+}`,
+  `#version 300 es
+precision highp float;
+in float vR; in vec3 vCore; in vec3 vRim; in float vSize; uniform float uScale; out vec4 o;
+void main() {
+  float d = length(gl_PointCoord - 0.5) * vSize / uScale;
+  float inCore = 1.0 - smoothstep(vR - 0.6, vR + 0.4, d);
+  float a = 1.0 - smoothstep(vR + 0.4, vR + 1.4, d);
+  if (a <= 0.01) discard;
+  o = vec4(mix(vRim, vCore, inCore), a);
+}`],
+  part: [`#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aCol; layout(location=2) in float aR;
+${PROJ}
+uniform float uScale;
+out vec3 vCol; out float vR; out float vSize; out float vSig;
+void main() {
+  vCol = aCol; vR = aR;
+  vSig = sqrt(3.2 * 3.2 + aR * aR * 0.5);
+  vSize = 6.0 * vSig * uScale;
+  gl_PointSize = vSize;
+  gl_Position = projectPos(aPos, 0.0);
+}`,
+  `#version 300 es
+precision highp float;
+in vec3 vCol; in float vR; in float vSize; in float vSig; uniform float uScale; out vec4 o;
+void main() {
+  float d = length(gl_PointCoord - 0.5) * vSize / uScale;
+  float core = 0.55 * (1.0 - smoothstep(vR - 0.7, vR + 0.5, d));
+  float halo = 0.85 * (1.0 - exp(-vR * vR / (2.0 * 3.2 * 3.2))) * exp(-d * d / (2.0 * vSig * vSig));
+  o = vec4(vCol * (core + halo), 1.0);
+}`],
+  bright: [FS_VERT, `#version 300 es
+precision highp float; in vec2 vUV; uniform sampler2D uTex; uniform vec2 uTexel; out vec4 o;
+vec3 b(vec2 uv) { return max(texture(uTex, uv).rgb - 185.0/255.0, 0.0); }
+void main() {
+  o = vec4(0.25 * (b(vUV + uTexel*vec2(-1.0,-1.0)) + b(vUV + uTexel*vec2(1.0,-1.0))
+                 + b(vUV + uTexel*vec2(-1.0, 1.0)) + b(vUV + uTexel*vec2(1.0, 1.0))), 1.0);
+}`],
+  blur: [FS_VERT, `#version 300 es
+precision highp float; in vec2 vUV; uniform sampler2D uTex; uniform vec2 uDir; uniform float uSigma; out vec4 o;
+void main() {
+  int R = int(ceil(3.0 * uSigma));
+  vec3 sum = vec3(0.0); float wsum = 0.0;
+  for (int i = -20; i <= 20; i++) {
+    if (i < -R || i > R) continue;
+    float w = exp(-float(i * i) / (2.0 * uSigma * uSigma));
+    sum += w * texture(uTex, vUV + uDir * float(i)).rgb; wsum += w;
+  }
+  o = vec4(sum / wsum, 1.0);
+}`],
+  comp: [FS_VERT, `#version 300 es
+precision highp float; in vec2 vUV; uniform sampler2D uScene; uniform sampler2D uBloom; out vec4 o;
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+void main() {
+  vec3 c = texture(uScene, vUV).rgb + 0.50 * texture(uBloom, vUV).rgb;
+  c += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
+  o = vec4(c, 1.0);
+}`],
+};
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error('Shader error: ' + gl.getShaderInfoLog(s));
+  return s;
+}
+const programs = {};
+for (const [name, [vs, fs]] of Object.entries(SRC)) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('Link error (' + name + '): ' + gl.getProgramInfoLog(p));
+  p.u = {};
+  programs[name] = p;
+}
+function U(prog, name) {
+  if (!(name in prog.u)) prog.u[name] = gl.getUniformLocation(prog, name);
+  return prog.u[name];
+}
+
+// --- scene upload ----------------------------------------------------------
+const scene = buildScene();
+function makeBuf(target, data, usage) {
+  const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, usage); return b;
+}
+for (const el of scene) {
+  const dyn = el.isPetal ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW;
+  el.bPos = makeBuf(gl.ARRAY_BUFFER, el.pos, dyn);
+  el.bNrm = makeBuf(gl.ARRAY_BUFFER, el.nrm, dyn);
+  el.bCol = makeBuf(gl.ARRAY_BUFFER, el.col, gl.STATIC_DRAW);
+  el.bUV = makeBuf(gl.ARRAY_BUFFER, el.uv, gl.STATIC_DRAW);
+  const setup = (vao, idx, attrs) => {
+    gl.bindVertexArray(vao);
+    for (const [loc, buf, size] of attrs) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    }
+    const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+    return vao;
+  };
+  el.vaoSurf = setup(gl.createVertexArray(), el.triIdx, [[0, el.bPos, 3], [1, el.bNrm, 3], [2, el.bCol, 3], [3, el.bUV, 2]]);
+  el.vaoWire = setup(gl.createVertexArray(), el.lineIdx, [[0, el.bPos, 3], [3, el.bUV, 2]]);
+}
+gl.bindVertexArray(null);
+const emptyVao = gl.createVertexArray();
+
+// dynamic point buffers (papillae, particles)
+const MAX_PAP = 1600, MAX_PART = 400;
+const papData = new Float32Array(MAX_PAP * 10), partData = new Float32Array(MAX_PART * 7);
+const bPap = makeBuf(gl.ARRAY_BUFFER, papData.byteLength, gl.DYNAMIC_DRAW);
+const bPart = makeBuf(gl.ARRAY_BUFFER, partData.byteLength, gl.DYNAMIC_DRAW);
+const vaoPap = gl.createVertexArray(), vaoPart = gl.createVertexArray();
+gl.bindVertexArray(vaoPap); gl.bindBuffer(gl.ARRAY_BUFFER, bPap);
+[[0,3,0],[1,1,12],[2,3,16],[3,3,28]].forEach(([l, s, off]) => { gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, s, gl.FLOAT, false, 40, off); });
+gl.bindVertexArray(vaoPart); gl.bindBuffer(gl.ARRAY_BUFFER, bPart);
+[[0,3,0],[1,3,12],[2,1,24]].forEach(([l, s, off]) => { gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, s, gl.FLOAT, false, 28, off); });
+gl.bindVertexArray(null);
+
+// --- render targets --------------------------------------------------------
+let W = 0, H = 0, T = null;
+function makeTex(w, h) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFbo(tex) {
+  const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return f;
+}
+function freeTargets() {
+  if (!T) return;
+  [T.msaaFbo, T.sceneFbo, T.bloomFboA, T.bloomFboB].forEach(f => gl.deleteFramebuffer(f));
+  [T.msaaColor, T.msaaDepth].forEach(r => gl.deleteRenderbuffer(r));
+  [T.sceneTex, T.bloomTexA, T.bloomTexB].forEach(t => gl.deleteTexture(t));
+}
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cssH = stage.clientHeight;
+  stage.style.setProperty('--sw', stage.clientWidth + 'px');
+  const scale = Math.min(1, Math.max(0.4, cssH * dpr / REF_H));
+  const nw = Math.round(REF_W * scale), nh = Math.round(REF_H * scale);
+  if (nw === W && nh === H) return;
+  W = nw; H = nh;
+  glCanvas.width = hudCanvas.width = W; glCanvas.height = hudCanvas.height = H;
+  freeTargets();
+  const samples = Math.min(4, gl.getParameter(gl.MAX_SAMPLES));
+  T = {};
+  T.msaaFbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, T.msaaFbo);
+  T.msaaColor = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, T.msaaColor);
+  gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, W, H);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, T.msaaColor);
+  T.msaaDepth = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, T.msaaDepth);
+  gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, W, H);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, T.msaaDepth);
+  T.sceneTex = makeTex(W, H); T.sceneFbo = makeFbo(T.sceneTex);
+  T.bw = Math.ceil(W / 4); T.bh = Math.ceil(H / 4);
+  T.bloomTexA = makeTex(T.bw, T.bh); T.bloomFboA = makeFbo(T.bloomTexA);
+  T.bloomTexB = makeTex(T.bw, T.bh); T.bloomFboB = makeFbo(T.bloomTexB);
+  T.scale = W / REF_W;
+  needsRender = true;
+}
+
+// ============================================================================
+// FRAME
+// ============================================================================
+const MAX_WAVE = 260;
+const ambRng = makeRng(42);
+const NAMB = 65;
+const ambPos = [], ambPhase = [];
+for (let i = 0; i < NAMB; i++) {
+  ambPos.push([ambRng.uniform(-1, 1), ambRng.uniform(-1.6, 1.8), ambRng.uniform(-0.8, 0.8)]);
+  ambPhase.push(ambRng.uniform(0, 2*PI));
+}
+const mod = (a, n) => ((a % n) + n) % n;
+
+function updatePetal(el, b) {
+  if (el.lastB === b) return;
+  el.lastB = b;
+  const P = el.pos, Pf = el.Pfull, Pc = el.Pclosed, n = P.length;
+  if (b < 0.999) { const ib = 1 - b; for (let k = 0; k < n; k++) P[k] = Pc[k]*ib + Pf[k]*b; }
+  else P.set(Pf);
+  computeNormals(P, el.Nu, el.Nv, el.nrm, false);
+  gl.bindBuffer(gl.ARRAY_BUFFER, el.bPos); gl.bufferSubData(gl.ARRAY_BUFFER, 0, P);
+  gl.bindBuffer(gl.ARRAY_BUFFER, el.bNrm); gl.bufferSubData(gl.ARRAY_BUFFER, 0, el.nrm);
+}
+
+const active = [];
+function renderFrame(t) {
+  const p = t / DURATION;
+  const azimuth = -0.32 + 0.56*smootherstep(0.0, 0.78, p) + 0.22*Math.sin(Math.max(0, (p - 0.72)/0.28)*PI);
+  const elevation = 0.06 + 0.10*smootherstep(0.10, 0.65, p) - 0.03*smootherstep(0.75, 1.0, p);
+  const cam = mul3(rotX(elevation), rotY(azimuth));
+  const camGL = new Float32Array(transpose3(cam));
+  const yT = -0.50*(1 - smootherstep(0, 0.32, p)) + 0.24*smootherstep(0.15, 0.55, p);
+  const target = [-0.02, yT, 0.08];
+  const camDist = 5.05 - 0.20*smootherstep(0.25, 0.85, p);
+  const globalWire = 1 - smootherstep(9.6, 11.4, t);
+
+  // --- per-element state + particles (CPU) ---
+  active.length = 0;
+  const wave = [];   // x,y,z, r,g,b, radius
+  const pushWave = (P, vi, rgb, rad) => { if (wave.length < MAX_WAVE) wave.push([P[vi*3], P[vi*3+1], P[vi*3+2], rgb[0], rgb[1], rgb[2], rad]); };
+  let nPap = 0;
+
+  for (const el of scene) {
+    if (t < el.wire_t0) continue;
+    const wProg = smootherstep(el.wire_t0, el.wire_t1, t);
+    const sProg = smootherstep(el.surf_t0, el.surf_t1, t);
+    if (el.isPetal) updatePetal(el, smootherstep(el.surf_t0, Math.min(DURATION, el.surf_t1 + 1.6), t));
+    active.push([el, wProg, sProg]);
+
+    const Nu = el.Nu, Nv = el.Nv;
+    if (sProg > 0.001) {
+      if (sProg > 0.03 && sProg < 0.98 && wave.length < MAX_WAVE) {
+        const lim = sProg*1.03;
+        let counter = 0;
+        for (let i = 0; i < Nu-1 && wave.length < MAX_WAVE; i++) for (let j = 0; j < Nv-1; j++) {
+          const d = lim - el.qEff[i*(Nv-1) + j];
+          if (d > 0 && d < 0.04) { if (counter++ % 7 === 0) pushWave(el.pos, i*Nv + j, [1.0, 225/255, 165/255], 2.4); if (wave.length >= MAX_WAVE) break; }
+        }
+      }
+      if (el.papillae) {
+        const N = el.nrm;
+        for (const pp of el.papillae) {
+          if (pp.effU > sProg*0.98 || nPap >= MAX_PAP) continue;
+          const k = pp.idx*3;
+          const nz = cam[6]*N[k] + cam[7]*N[k+1] + cam[8]*N[k+2];
+          if (Math.abs(nz) <= 0.14) continue;
+          const o = nPap*10;
+          papData[o] = el.pos[k]; papData[o+1] = el.pos[k+1]; papData[o+2] = el.pos[k+2];
+          papData[o+3] = pp.r;
+          papData.set(el.papCore, o+4); papData.set(el.papRim, o+7);
+          nPap++;
+        }
+      }
+    }
+    const wVis = globalWire*(1 - 0.82*smootherstep(0.60, 1.0, sProg));
+    if (wProg > 0.01 && wVis > 0.04) {
+      const maxU = Math.max(2, Math.round(wProg*Nu));
+      el.wMaxU = (maxU - 1)/(Nu - 1);
+      el.wCol = el.wireColor.map(c => c*(0.35 + 0.65*wVis)*0.58);
+      el.wOn = true;
+      if (wProg < 0.98) for (const j of el.vIdx) if (j % (el.strideV*2) === 0)
+        pushWave(el.pos, (maxU-1)*Nv + j, [1.0, 240/255, 190/255], 3.0);
+    } else el.wOn = false;
+  }
+
+  // ambient pollen
+  let nPart = 0;
+  for (let i = 0; i < NAMB; i++) {
+    const ap = ambPos[i], ph = ambPhase[i];
+    let y = ap[1] + 0.18*t + 0.08*Math.sin(t*1.5 + ph);
+    y = mod(y + 1.6, 3.4) - 1.6;
+    const x = ap[0] + 0.08*Math.cos(t*1.1 + ph);
+    const tw = Math.max(0, 0.4 + 0.6*Math.sin(t*2.8 + ph));
+    const wx = x - target[0], wy = y - target[1], wz = ap[2] - target[2];
+    const zc = camDist - (cam[6]*wx + cam[7]*wy + cam[8]*wz);
+    const rad = Math.max(1, Math.round((1.5 + 2.5*(i % 3))*(4.5/Math.max(2.5, zc))));
+    const o = nPart*7;
+    partData[o] = x; partData[o+1] = y; partData[o+2] = ap[2];
+    partData[o+3] = 235/255*tw; partData[o+4] = 175/255*tw; partData[o+5] = 95/255*tw; partData[o+6] = rad;
+    nPart++;
+  }
+  for (const w of wave) { partData.set(w, nPart*7); nPart++; }
+
+  // --- draw scene into the multisampled target ---
+  const setCam = prog => {
+    gl.uniformMatrix3fv(U(prog, 'uCam'), false, camGL);
+    gl.uniform3fv(U(prog, 'uTarget'), target);
+    gl.uniform1f(U(prog, 'uDist'), camDist);
+  };
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.msaaFbo);
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST); gl.depthMask(true);
+  gl.clearColor(0, 0, 0, 1); gl.clearDepth(1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(programs.bg); gl.bindVertexArray(emptyVao); gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+  let pr = programs.surf; gl.useProgram(pr); setCam(pr);
+  for (const [el, , sProg] of active) {
+    if (sProg <= 0.001) continue;
+    gl.uniform1f(U(pr, 'uSProg'), sProg); gl.uniform1f(U(pr, 'uSss'), el.sss);
+    gl.uniform1f(U(pr, 'uSpec'), el.spec); gl.uniform1f(U(pr, 'uShin'), el.shin);
+    gl.bindVertexArray(el.vaoSurf);
+    gl.drawElements(gl.TRIANGLES, el.triIdx.length, gl.UNSIGNED_SHORT, 0);
+  }
+
+  if (nPap > 0) {
+    pr = programs.pap; gl.useProgram(pr); setCam(pr); gl.uniform1f(U(pr, 'uScale'), T.scale);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+    gl.bindVertexArray(vaoPap); gl.bindBuffer(gl.ARRAY_BUFFER, bPap);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, papData, 0, nPap*10);
+    gl.drawArrays(gl.POINTS, 0, nPap);
+    gl.depthMask(true);
+  }
+
+  gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  pr = programs.wire; gl.useProgram(pr); setCam(pr);
+  for (const [el] of active) {
+    if (!el.wOn) continue;
+    gl.uniform1f(U(pr, 'uWMax'), el.wMaxU); gl.uniform3fv(U(pr, 'uColor'), el.wCol);
+    gl.bindVertexArray(el.vaoWire);
+    gl.drawElements(gl.LINES, el.lineIdx.length, gl.UNSIGNED_SHORT, 0);
+  }
+
+  pr = programs.part; gl.useProgram(pr); setCam(pr); gl.uniform1f(U(pr, 'uScale'), T.scale);
+  gl.bindVertexArray(vaoPart); gl.bindBuffer(gl.ARRAY_BUFFER, bPart);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, partData, 0, nPart*7);
+  gl.drawArrays(gl.POINTS, 0, nPart);
+  gl.disable(gl.BLEND);
+
+  // --- resolve MSAA, bloom, composite ---
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, T.msaaFbo); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, T.sceneFbo);
+  gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+
+  gl.bindVertexArray(emptyVao);
+  const bindTex = (unit, tex) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); };
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.bloomFboA); gl.viewport(0, 0, T.bw, T.bh);
+  pr = programs.bright; gl.useProgram(pr); bindTex(0, T.sceneTex);
+  gl.uniform1i(U(pr, 'uTex'), 0); gl.uniform2f(U(pr, 'uTexel'), 1/W, 1/H);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  const sigma = 18*(W/REF_W)/4;
+  pr = programs.blur; gl.useProgram(pr); gl.uniform1i(U(pr, 'uTex'), 0); gl.uniform1f(U(pr, 'uSigma'), sigma);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.bloomFboB); bindTex(0, T.bloomTexA);
+  gl.uniform2f(U(pr, 'uDir'), 1/T.bw, 0); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.bloomFboA); bindTex(0, T.bloomTexB);
+  gl.uniform2f(U(pr, 'uDir'), 0, 1/T.bh); gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, W, H);
+  pr = programs.comp; gl.useProgram(pr);
+  bindTex(0, T.sceneTex); bindTex(1, T.bloomTexA);
+  gl.uniform1i(U(pr, 'uScene'), 0); gl.uniform1i(U(pr, 'uBloom'), 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  drawHud(t);
+}
+
+// ============================================================================
+// HUD OVERLAY (2D canvas)
+// ============================================================================
+const FONT = '"Segoe UI", "Helvetica Neue", Arial, sans-serif';
+
+// ----------------------------------------------------------------------------
+// YOUR TEXT GOES HERE
+// Fill in the `text` of any line below (leave it '' to show nothing), or add
+// more lines. Coordinates are on the 1080 x 1920 reference canvas.
+//   x, y   : left edge / baseline of the line
+//   capH   : capital-letter height in px (the font size is derived from this)
+//   color  : any CSS colour
+//   start  : seconds after the animation starts before the first letter appears
+// Every letter fades in one after another, starting from the first frame.
+// ----------------------------------------------------------------------------
+const CUSTOM_TEXT = [
+  { text: '', x: 68, y: 118,            capH: 17, color: 'rgb(235,225,215)', start: 0.0 },  // headline
+  { text: '', x: 68, y: 152,            capH: 10, color: 'rgb(165,150,135)', start: 0.6 },  // sub-line
+  { text: '', x: 68, y: REF_H - 135,    capH: 11, color: 'rgb(235,195,175)', start: 1.2 },  // bottom line 1
+  { text: '', x: 68, y: REF_H - 135 + 28, capH: 9, color: 'rgb(165,150,135)', start: 1.8 }, // bottom line 2
+];
+const LETTER_DELAY = 0.06;   // seconds between one letter starting to fade and the next
+const LETTER_FADE  = 0.45;   // seconds each letter takes to fade fully in
+const TEXT_ALPHA   = 0.85;   // overall text opacity (same as the original)
+
+function drawHud(t) {
+  hud.setTransform(1, 0, 0, 1, 0, 0);
+  hud.clearRect(0, 0, W, H);
+  hud.setTransform(W/REF_W, 0, 0, W/REF_W, 0, 0);
+  hud.textBaseline = 'alphabetic';
+  for (const line of CUSTOM_TEXT) {
+    const str = line.text;
+    if (!str) continue;
+    hud.font = (line.capH/0.716) + 'px ' + FONT;
+    hud.fillStyle = line.color;
+    for (let i = 0; i < str.length; i++) {
+      const a = smoothstep(0, 1, (t - (line.start || 0) - i*LETTER_DELAY)/LETTER_FADE);
+      if (a <= 0.001) break;                       // later letters haven't started yet
+      hud.globalAlpha = a*TEXT_ALPHA;
+      // measure the prefix so letters keep the font's natural spacing
+      hud.fillText(str[i], line.x + hud.measureText(str.slice(0, i)).width, line.y);
+    }
+  }
+  hud.globalAlpha = 1;
+}
+
+// ============================================================================
+// PLAYBACK + CONTROLS
+// ============================================================================
+const intro = document.getElementById('intro'), hello = document.getElementById('hello');
+const goBtn = document.getElementById('go');
+let playing = false, clock = 0, last = performance.now(), needsRender = true;
+
+// The animation waits (frozen on its first frame, dimmed behind the welcome screen)
+// until the button is pressed. Opening the page with #t=5 skips the welcome screen
+// and shows that moment instead, which is handy for testing.
+const params = new URLSearchParams(location.hash.slice(1));
+if (params.has('t')) {
+  clock = Math.max(0, Math.min(DURATION, parseFloat(params.get('t')) || 0));
+  intro.classList.add('gone');
+}
+
+// ---- welcome / ending messages: letters fade in one after another ---------------
+const WELCOME_TEXT   = 'HELLO AWE, HEARD YOU LIKE TULIPS';
+const WELCOME_BUTTON = 'click me please';
+const ENDING_TEXT    = 'LIKED IT? WANNA WATCH AGAIN?';
+const ENDING_BUTTON  = 'yes please';
+const LETTER_DELAY_WELCOME = 0.07;   // seconds between letters
+function buildScreen(text, label) {
+  let letterNo = 0;
+  hello.textContent = '';
+  hello.setAttribute('aria-label', text);
+  goBtn.textContent = label;
+  text.split(' ').forEach((word, wi, words) => {
+    const w = document.createElement('span'); w.className = 'w';
+    for (const ch of word) {
+      const c = document.createElement('span'); c.className = 'c'; c.textContent = ch;
+      c.style.animationDelay = (0.4 + letterNo++ * LETTER_DELAY_WELCOME).toFixed(2) + 's';
+      w.appendChild(c);
+    }
+    hello.appendChild(w);
+    if (wi < words.length - 1) { hello.appendChild(document.createTextNode(' ')); letterNo++; }
+  });
+  // the button appears once the last letter is in (re-set the style so its fade-in replays)
+  goBtn.style.animation = 'none'; goBtn.style.opacity = '';
+  void goBtn.offsetWidth;
+  goBtn.style.animation = '';
+  goBtn.style.animationDelay = (0.4 + letterNo * LETTER_DELAY_WELCOME + 0.5).toFixed(2) + 's';
+  goBtn.disabled = false;
+}
+buildScreen(WELCOME_TEXT, WELCOME_BUTTON);
+
+// ---- when the animation ends: dim the finished scene and show the ending message --
+function showEnding() {
+  playing = false;
+  hello.textContent = '';
+  goBtn.disabled = true; goBtn.style.animation = 'none'; goBtn.style.opacity = '0';
+  intro.classList.remove('gone');
+  intro.classList.add('leaving');                // start fully transparent...
+  void intro.offsetWidth;
+  intro.classList.remove('leaving');             // ...then fade the dimming in over the final frame
+  setTimeout(() => buildScreen(ENDING_TEXT, ENDING_BUTTON), 700);
+}
+
+// ---- start: fade the welcome screen out and begin the animation -----------------
+function start() {
+  if (playing || intro.classList.contains('leaving')) return;
+  goBtn.disabled = true;
+  intro.classList.add('leaving');
+  setTimeout(() => intro.classList.add('gone'), 1100);   // after the 1s CSS fade
+  clock = 0; last = performance.now(); playing = true;
+}
+goBtn.addEventListener('click', start);
+window.addEventListener('resize', resize);
+
+function frame(now) {
+  const dt = Math.min(0.1, (now - last)/1000); last = now;
+  if (playing) {
+    clock += dt;
+    if (clock > DURATION + HOLD) { clock = DURATION; showEnding(); }
+    needsRender = true;
+  }
+  if (needsRender) {
+    const t = Math.min(clock, DURATION);
+    renderFrame(t);
+    needsRender = false;
+  }
+  requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+window.__lily = { ready: true, setTime: v => { clock = v; needsRender = true; } };
+})();
+</script>
+</body>
+</html>
